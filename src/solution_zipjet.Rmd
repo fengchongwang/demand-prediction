@@ -1,0 +1,301 @@
+---
+title: "Solution to Zipjet Question"
+author: "Fengchong Wang"
+date: "7 October 2018"
+output: html_document
+---
+## Directory structure
+make a new folder *src* in the same folder as existing *data* folder, and place the script *solution_zipjet.Rmd* into the src. Then open the script in a rstudio editor to view the code.
+
+## Initialization
+```{r env, message=FALSE}
+# Install essential packages
+list.of.packages <- c("data.table",'moments', 'VGAM','poweRlaw', 'xgboost', 'glmnet', 'kknn')
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+# Detect script directory
+if(length(new.packages)) install.packages(new.packages, repos='http://cran.us.r-project.org')
+src_dir = tryCatch({
+  paste0(dirname(rstudioapi::getSourceEditorContext()$path),"/../src/")
+}, warning = function(w) {
+}, error = function(e) {
+  library(here)
+  return(paste0(here(),'/'))
+}, finally = {
+}
+)
+# Load library
+library(data.table)
+library(moments)
+library(VGAM)
+library(poweRlaw)
+library(foreach)
+library(doMC)
+library(kknn)
+library(xgboost)
+library(glmnet)
+# Environment variables
+data_dir = paste0(src_dir,'../data/')
+# Load data
+demand = fread(paste0(data_dir,'demand.csv'))
+supply = fread(paste0(data_dir,'supply.csv'))
+```
+
+## Feature Engineering
+Each demand now has 19-dim feature.
+```{r engineering}
+supply[, time_diff_timeslot_from := as.numeric(difftime(supply[,paste0(day, ' ',timeslot_from)],supply[1,calculated_datetime], units = 'hours'))]
+supply[, time_diff_calculated_datetime := as.numeric(difftime(supply[,calculated_datetime],supply[1,calculated_datetime], units = 'hours'))]
+demand[shift=='MS', time:='19:30:00']
+demand[shift=='ES', time:='13:30:00']
+demand[, time_diff_day_from := as.numeric(difftime(demand[,paste0(day, ' ',time)],supply[1,calculated_datetime], units = 'hours'))]
+print(demand)
+
+# i = 1
+# time_demand = demand[i, time_diff_day_from]
+# supply_extracted = supply[time_diff_timeslot_from <= time_demand+2.5 & time_diff_timeslot_from > time_demand-2.5]
+# # num of queries
+# num_queries = nrow(supply_extracted)
+# hist_supply = supply_extracted[, hist(avail_area_ratio, breaks=seq(0,1,0.1), plot = FALSE)]
+# sum_ratio = sum(hist_supply$counts)
+# # Use bin ratios to capture information from bimodal distribution of avail_area_ratio
+# # By doing supply[, sort(unique(avail_area_ratio))], one can find that there are only 21 unique avail_area_ratio, so one may consider engineer this as categorical variable if more demand data are provided.
+# bin_ratios = hist_supply$counts/sum_ratio
+# num_non_zero_ratio = nrow(supply_extracted[avail_area_ratio>0])
+# # Use bimodality coefficient to reflect bimodality
+# bimodality_coef = skewness(supply_extracted[,avail_area_ratio])^2+1/kurtosis(supply_extracted[,avail_area_ratio])
+# # Median and mean might still usefull, preserve them
+# median_ratio = supply_extracted[, median(avail_area_ratio, na.rm = TRUE)]
+# mean_ratio = supply_extracted[, mean(avail_area_ratio)]
+# # The distribution of time_diff_calculated_datetime for a timeslot seems to follow power-law distribution
+# supply_extracted[,hist(time_diff_calculated_datetime, breaks = 200)]
+# 
+# 
+# # Fit time_diff_timeslot_from by two power law distributions, then use their parameters as features
+# m_bl = conpl$new(supply_extracted[avail_area_ratio>0, avail_area_ratio])
+# est = estimate_xmin(m_bl)
+# m_bl$setXmin(est)
+# para1 = m_bl$xmin
+# m_bl_ln = conlnorm$new(supply_extracted[avail_area_ratio>0, avail_area_ratio])
+# est = estimate_xmin(m_bl_ln)
+# m_bl_ln$setXmin(est)
+# para2 = m_bl_ln$xmin
+# para3 = m_bl_ln$pars[1]
+# para4 = m_bl_ln$pars[2]
+# 
+# # grid unit
+# table_grid = supply_extracted[, table(grid_unit)]
+# # Use grid unit query frequency is not useful. Assumption: the data were extracted from a larger database by stratified sampling
+
+
+engineer_for_one_row <- function(i, supply, demand, window_size = 2.5) {
+  time_demand = demand[i, time_diff_day_from]
+  supply_extracted = supply[time_diff_timeslot_from <= time_demand+window_size & time_diff_timeslot_from > time_demand-window_size]
+  # num of queries
+  num_queries = nrow(supply_extracted)
+  hist_supply = supply_extracted[, hist(avail_area_ratio, breaks=seq(0,1,0.1), plot = FALSE)]
+  sum_ratio = sum(hist_supply$counts)
+  # Use bin ratios to capture information from bimodal distribution of avail_area_ratio
+  # By doing supply[, sort(unique(avail_area_ratio))], one can find that there are only 21 unique avail_area_ratio, so one may consider engineer this as categorical variable if more demand data are provided.
+  bin_ratios = hist_supply$counts/sum_ratio
+  num_non_zero_ratio = nrow(supply_extracted[avail_area_ratio>0])
+  # Use bimodality coefficient to reflect bimodality
+  bimodality_coef = skewness(supply_extracted[,avail_area_ratio])^2+1/kurtosis(supply_extracted[,avail_area_ratio])
+  # Median might still usefull, preserve it
+  median_ratio = supply_extracted[, median(avail_area_ratio, na.rm = TRUE)]
+  # The distribution of how long query time before seems to follow power-law distribution
+  num_queries_within_half_day = nrow(supply_extracted[time_demand - time_diff_calculated_datetime <= 12])
+  num_queries_within_one_day = nrow(supply_extracted[time_demand - time_diff_calculated_datetime <= 24])
+  num_queries_within_two_day = nrow(supply_extracted[time_demand - time_diff_calculated_datetime <= 48])
+  num_queries_within_one_week = nrow(supply_extracted[time_demand - time_diff_calculated_datetime <= 168])
+  
+  # Fit (time_demand - time_diff_calculated_datetime) by a power law distribution, then use its parameters as features
+  m_bl = conpl$new(supply_extracted[time_demand - time_diff_calculated_datetime>0, time_demand - time_diff_calculated_datetime])
+  est = estimate_xmin(m_bl)
+  m_bl$setXmin(est)
+  para1 = m_bl$xmin
+  # Commented because fitting is too time-consuming
+  # m_bl_ln = conlnorm$new(supply_extracted[time_demand - time_diff_calculated_datetime>0, time_demand - time_diff_calculated_datetime])
+  # est = estimate_xmin(m_bl_ln)
+  # m_bl_ln$setXmin(est)
+  # para2 = m_bl_ln$xmin
+  # para3 = m_bl_ln$pars[1]
+  # para4 = m_bl_ln$pars[2]
+  
+  return(c(num_queries, bin_ratios, num_non_zero_ratio, bimodality_coef, median_ratio, num_queries_within_half_day, num_queries_within_one_day, num_queries_within_two_day, num_queries_within_one_week, para1))
+}
+
+registerDoMC(7)
+engineered_demand = foreach (i = 1:nrow(demand), .packages = c('data.table', 'moments','poweRlaw')) %dopar% {
+  engineer_for_one_row(i,supply,demand)
+}
+registerDoSEQ()
+engineered_demand = matrix(unlist(engineered_demand), ncol=19, byrow=TRUE)
+print(head(engineered_demand))
+
+test_x = matrix(nrow=7*2, ncol=19)
+test_data = copy(demand[1:14])
+
+test_data[, day := rep(as.character(as.Date('2018-07-10')+0:6),2)]
+test_data[, shift := c(rep('MS',7),rep('ES',7))]
+test_data[, num_pickups := NA_integer_]
+test_data[shift=='MS', time:='19:30:00']
+test_data[shift=='ES', time:='13:30:00']
+test_data[, time_diff_day_from := as.numeric(difftime(test_data[,paste0(day, ' ',time)],supply[1,calculated_datetime], units = 'hours'))]
+print(test_data)
+
+engineered_test_demand = sapply(1:14, engineer_for_one_row, supply,test_data)
+engineered_test_demand = t(engineered_test_demand)
+print(head(engineered_test_demand))
+
+```
+
+## Investigation of three models
+
+Investigate fitting of xgboost model, GLM model and KKNN model, and their ensembling.
+
+```{r fit}
+# XGBoost
+library(xgboost)
+dat = engineered_demand[-which(is.na(engineered_demand[,2])),]
+set.seed(554)
+dat = dat[sample(nrow(dat)),]
+set.seed(484)
+val_idx = sample(1:nrow(dat), size = 50,replace = FALSE)
+train_x = dat[-val_idx,]
+train_y = demand[-which(is.na(engineered_demand[,2])), num_pickups][-val_idx]
+val_x = dat[val_idx,]
+val_y = demand[-which(is.na(engineered_demand[,2])), num_pickups][val_idx]
+
+dtrain = xgb.DMatrix(data = train_x, label=train_y)
+dval = xgb.DMatrix(data = val_x, label=val_y)
+watchlist <- list(train = dtrain, eval = dval)
+xgb_nthread = 7
+param <- list(max_depth = 1, eta = 0.0006, subsample = 0.5, gamma = 50,
+                  lambda = 0.5, alpha = 0.5,
+                  objective = "reg:linear",nthread = xgb_nthread, seed=154)
+bst <- xgb.train(param, data = dtrain, nrounds = 10000, watchlist = watchlist, silent=1,early_stopping_rounds = 30, verbose = 0)
+bst <- xgb.train(param, data = dtrain, nrounds = 5000, watchlist = watchlist, silent=1,early_stopping_rounds = 30, verbose = 0)
+pred_xgb = as.integer(round(predict(bst, dval)))
+print(pred_xgb)
+# Generalize linear model
+library(glmnet)
+train_x_glm = train_x
+train_y_glm = train_y
+val_x_glm = val_x
+train_x_glm[is.na(train_x_glm)] = 0
+val_x_glm[is.na(val_x_glm)] = 0
+model = glmnet(train_x_glm, y=train_y_glm, family=c("gaussian"), alpha = 0.5, lambda = 0.5)
+pred_glm = as.integer(round(predict(model,newx = val_x_glm)))
+print(pred_glm)
+# KKNN
+library(kknn)
+train = data.frame(cbind(train_x_glm,train_y_glm))
+names(train) = c(names(train)[1:(length(names(train))-1)],'y')
+test = data.frame(cbind(val_x_glm,val_y))
+names(test) = c(names(test)[1:(length(names(test))-1)],'y')
+kknn_fit = train.kknn(y ~ ., data=train)
+pred_kknn = predict(kknn_fit, test[,-20])
+print(pred_kknn)
+# Linear combination of three models
+ensemble_models = glmnet(y = val_y, x= cbind(pred_xgb, pred_glm, pred_kknn), family=c("gaussian"), alpha = 0.5, lambda = 0.5)
+
+```
+
+## Fit three models
+```{r, message=FALSE}
+# XGBoost
+dtrain = xgb.DMatrix(data = rbind(train_x, val_x), label=c(train_y, val_y))
+xgb_nthread = 7
+param <- list(max_depth = 1, eta = 0.0006, subsample = 0.5, gamma = 50,
+                  lambda = 0.5, alpha = 0.5,
+                  objective = "reg:linear",nthread = xgb_nthread, seed=154)
+bst <- xgb.train(param, data = dtrain, nrounds = 5500, silent=1, verbose = 0)
+pred_xgb = as.integer(round(predict(bst, engineered_test_demand)))
+print(pred_xgb)
+# GLM
+train_x_glm = rbind(train_x, val_x)
+train_y_glm = c(train_y, val_y)
+train_x_glm[is.na(train_x_glm)] = 0
+engineered_test_demand_glm = engineered_test_demand
+model = glmnet(train_x_glm, y=train_y_glm, family=c("gaussian"), alpha = 0.5, lambda = 0.5)
+engineered_test_demand_glm[is.na(engineered_test_demand_glm)] = 0
+pred_glm = as.integer(round(predict(model,newx = engineered_test_demand_glm)))
+print(pred_glm)
+# KKNN
+train = data.frame(cbind(train_x_glm,train_y_glm))
+names(train) = c(names(train)[1:(length(names(train))-1)],'y')
+test = data.frame(engineered_test_demand_glm)
+names(test) = paste0('V',1:19)
+kknn_fit = train.kknn(y ~ ., data=train)
+pred_kknn = predict(kknn_fit, test)
+print(pred_kknn)
+
+test_data[,num_pickups := as.integer(round(predict(ensemble_models,newx = cbind(pred_xgb, pred_glm,pred_kknn))))]
+test_data[,time:=NULL]
+test_data[, time_diff_day_from:=NULL]
+
+```
+
+## Prediction
+```{r}
+print(test_data)
+```
+
+## R session info
+```
+R version 3.4.3 (2017-11-30)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 14.04.5 LTS
+
+Matrix products: default
+BLAS: /usr/lib/libblas/libblas.so.3.0
+LAPACK: /usr/lib/lapack/liblapack.so.3.0
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C               LC_TIME=de_DE.UTF-8       
+ [4] LC_COLLATE=en_US.UTF-8     LC_MONETARY=de_DE.UTF-8    LC_MESSAGES=en_US.UTF-8   
+ [7] LC_PAPER=de_DE.UTF-8       LC_NAME=C                  LC_ADDRESS=C              
+[10] LC_TELEPHONE=C             LC_MEASUREMENT=de_DE.UTF-8 LC_IDENTIFICATION=C       
+
+attached base packages:
+ [1] parallel  splines   stats4    stats     graphics  grDevices utils     datasets 
+ [9] methods   base     
+
+other attached packages:
+ [1] kknn_1.3.1        glmnet_2.0-13     Matrix_1.2-11     xgboost_0.6-4    
+ [5] moments_0.14      doMC_1.3.4        iterators_1.0.8   foreach_1.4.3    
+ [9] poweRlaw_0.70.1   VGAM_1.0-6        data.table_1.10.4
+
+loaded via a namespace (and not attached):
+ [1] igraph_1.0.1     Rcpp_0.12.10     rstudioapi_0.6   knitr_1.15.1     magrittr_1.5    
+ [6] lattice_0.20-35  stringr_1.2.0    tools_3.4.3      grid_3.4.3       htmltools_0.3.6 
+[11] yaml_2.1.14      digest_0.6.12    rprojroot_1.2    codetools_0.2-15 rsconnect_0.7   
+[16] evaluate_0.10    rmarkdown_1.5    stringi_1.1.5    compiler_3.4.3   backports_1.0.5 R version 3.4.3 (2017-11-30)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 14.04.5 LTS
+
+Matrix products: default
+BLAS: /usr/lib/libblas/libblas.so.3.0
+LAPACK: /usr/lib/lapack/liblapack.so.3.0
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C               LC_TIME=de_DE.UTF-8       
+ [4] LC_COLLATE=en_US.UTF-8     LC_MONETARY=de_DE.UTF-8    LC_MESSAGES=en_US.UTF-8   
+ [7] LC_PAPER=de_DE.UTF-8       LC_NAME=C                  LC_ADDRESS=C              
+[10] LC_TELEPHONE=C             LC_MEASUREMENT=de_DE.UTF-8 LC_IDENTIFICATION=C       
+
+attached base packages:
+ [1] parallel  splines   stats4    stats     graphics  grDevices utils     datasets 
+ [9] methods   base     
+
+other attached packages:
+ [1] kknn_1.3.1        glmnet_2.0-13     Matrix_1.2-11     xgboost_0.6-4    
+ [5] moments_0.14      doMC_1.3.4        iterators_1.0.8   foreach_1.4.3    
+ [9] poweRlaw_0.70.1   VGAM_1.0-6        data.table_1.10.4
+
+loaded via a namespace (and not attached):
+ [1] igraph_1.0.1     Rcpp_0.12.10     rstudioapi_0.6   knitr_1.15.1     magrittr_1.5    
+ [6] lattice_0.20-35  stringr_1.2.0    tools_3.4.3      grid_3.4.3       htmltools_0.3.6 
+[11] yaml_2.1.14      digest_0.6.12    rprojroot_1.2    codetools_0.2-15 rsconnect_0.7   
+[16] evaluate_0.10    rmarkdown_1.5    stringi_1.1.5    compiler_3.4.3   backports_1.0.5 
+```
